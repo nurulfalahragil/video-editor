@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   EditorState,
   Project,
@@ -12,20 +12,14 @@ import {
   HistorySnapshot,
 } from '../types/editor';
 import { MediaAsset } from '../types/media';
+import {
+  formatTime,
+  getProjectDuration,
+  MIN_CLIP_DURATION,
+  canDropOnTrack,
+} from '../utils/timelineMath';
 
-export function formatTimecode(seconds: number): string {
-  const clamped = Math.max(0, seconds);
-  const mins = Math.floor(clamped / 60);
-  const secs = Math.floor(clamped % 60);
-  const hundredths = Math.floor((clamped % 1) * 100);
-
-  const mm = mins.toString().padStart(2, '0');
-  const ss = secs.toString().padStart(2, '0');
-  const cs = hundredths.toString().padStart(2, '0');
-
-  return `${mm}:${ss}.${cs}`;
-}
-
+export const formatTimecode = formatTime;
 export function formatSecondsToTime(seconds: number): string {
   const clamped = Math.max(0, Math.floor(seconds));
   const mins = Math.floor(clamped / 60);
@@ -39,20 +33,21 @@ const INITIAL_PROJECT: Project = {
   width: 1920,
   height: 1080,
   fps: 30,
-  duration: 30.0, // 30 seconds fixed sample duration as per requirements
+  duration: 30.0,
   aspectRatio: '16:9',
 };
 
 const INITIAL_TRACKS: Track[] = [
-  { id: 'track_video', type: 'video', name: 'Video', locked: false, muted: false, visible: true },
-  { id: 'track_overlay', type: 'overlay', name: 'Overlay', locked: false, muted: false, visible: true },
-  { id: 'track_text', type: 'text', name: 'Text', locked: false, muted: false, visible: true },
-  { id: 'track_subtitle', type: 'subtitle', name: 'Subtitle', locked: false, muted: false, visible: true },
-  { id: 'track_audio', type: 'audio', name: 'Audio', locked: false, muted: false, visible: true },
+  { id: 'track_video_1', type: 'video', name: 'Video 1', locked: false, muted: false, visible: true, volume: 100, height: 70 },
+  { id: 'track_overlay_1', type: 'overlay', name: 'Overlay 1', locked: false, muted: false, visible: true, volume: 100, height: 70 },
+  { id: 'track_text_1', type: 'text', name: 'Text 1', locked: false, muted: false, visible: true, volume: 100, height: 50 },
+  { id: 'track_subtitle_1', type: 'subtitle', name: 'Subtitle 1', locked: false, muted: false, visible: true, volume: 100, height: 50 },
+  { id: 'track_audio_1', type: 'audio', name: 'Audio 1', locked: false, muted: false, visible: true, volume: 100, height: 70 },
 ];
 
-// Phase 2: Per Section 31, start empty for a real new project
 const INITIAL_CLIPS: Clip[] = [];
+
+export const ZOOM_LEVELS = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0];
 
 interface EditorContextType extends EditorState {
   setProjectName: (name: string) => void;
@@ -69,13 +64,32 @@ interface EditorContextType extends EditorState {
   setPreviewQuality: (quality: PreviewQuality) => void;
   setVolume: (vol: number) => void;
   toggleMute: () => void;
+  // Phase 3 Track controls
   toggleTrackLock: (trackId: string) => void;
   toggleTrackVisibility: (trackId: string) => void;
   toggleTrackMute: (trackId: string) => void;
-  updateClipTransform: (clipId: string, partial: Partial<ClipTransform>) => void;
-  updateClipAudio: (clipId: string, partial: Partial<ClipAudio>) => void;
+  setTrackVolume: (trackId: string, volume: number) => void;
+  setTrackHeight: (trackId: string, height: number) => void;
+  // Phase 3 Editing Operations
+  moveClip: (clipId: string, newStartTime: number, newTrackId?: string) => void;
+  trimClipLeft: (clipId: string, newStartTime: number, newTrimStart: number, newDuration: number) => void;
+  trimClipRight: (clipId: string, newDuration: number, newTrimEnd: number) => void;
+  splitClip: (clipId?: string) => boolean;
+  deleteClip: (clipId?: string) => void;
+  duplicateClip: (clipId?: string) => void;
+  copyClip: (clipId?: string) => void;
+  pasteClip: (targetTrackId?: string) => boolean;
+  updateClip: (clipId: string, updates: Partial<Clip>) => void;
+  toggleClipMute: (clipId: string) => void;
+  stepFrame: (direction: 'forward' | 'backward', stepSeconds?: number) => void;
+  // Snapping
+  toggleSnap: () => void;
+  setActiveSnapGuide: (guideTime: number | null) => void;
+  snapTargets: number[];
+  // History
   undo: () => void;
   redo: () => void;
+  pushSnapshot: (description?: string) => void;
   triggerSave: () => void;
   selectedClip: Clip | null;
   // Phase 2 Media Library actions
@@ -100,11 +114,14 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [selectedClipId, setSelectedClipIdState] = useState<string | null>(null);
   const [activePanel, setActivePanel] = useState<SidebarTab>('media');
-  const [zoom, setZoomState] = useState<number>(1.0); // 1.0 = 100%
+  const [zoom, setZoomState] = useState<number>(1.0);
+  const [snapEnabled, setSnapEnabled] = useState<boolean>(true);
+  const [activeSnapGuide, setActiveSnapGuide] = useState<number | null>(null);
   const [saveStatus, setSaveStatus] = useState<'Saved' | 'Saving...'>('Saved');
   const [previewQuality, setPreviewQuality] = useState<PreviewQuality>('Full');
   const [volume, setVolume] = useState<number>(100);
   const [isMuted, setIsMuted] = useState<boolean>(false);
+  const [clipboardClip, setClipboardClip] = useState<Clip | null>(null);
 
   // Phase 2: Media Assets state
   const [assets, setAssets] = useState<MediaAsset[]>([]);
@@ -114,17 +131,28 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [undoStack, setUndoStack] = useState<HistorySnapshot[]>([]);
   const [redoStack, setRedoStack] = useState<HistorySnapshot[]>([]);
 
-  const pushSnapshot = useCallback(() => {
-    setUndoStack((prev) => [
-      ...prev.slice(-25),
-      {
-        projectName: project.name,
-        clips: JSON.parse(JSON.stringify(clips)),
-        selectedClipId,
-      },
-    ]);
-    setRedoStack([]);
-  }, [project.name, clips, selectedClipId]);
+  // Calculate dynamic project duration based on clips
+  useEffect(() => {
+    const computedDuration = getProjectDuration(clips, 30);
+    setProject((prev) => (prev.duration !== computedDuration ? { ...prev, duration: computedDuration } : prev));
+  }, [clips]);
+
+  const pushSnapshot = useCallback(
+    (description?: string) => {
+      setUndoStack((prev) => [
+        ...prev.slice(-30),
+        {
+          description,
+          projectName: project.name,
+          clips: JSON.parse(JSON.stringify(clips)),
+          tracks: JSON.parse(JSON.stringify(tracks)),
+          selectedClipId,
+        },
+      ]);
+      setRedoStack([]);
+    },
+    [project.name, clips, tracks, selectedClipId],
+  );
 
   const undo = useCallback(() => {
     if (undoStack.length === 0) return;
@@ -134,8 +162,10 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setRedoStack((prev) => [
       ...prev,
       {
+        description: 'Before Undo',
         projectName: project.name,
         clips: JSON.parse(JSON.stringify(clips)),
+        tracks: JSON.parse(JSON.stringify(tracks)),
         selectedClipId,
       },
     ]);
@@ -143,8 +173,9 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     setProject((p) => ({ ...p, name: previous.projectName }));
     setClips(previous.clips);
+    setTracks(previous.tracks);
     setSelectedClipIdState(previous.selectedClipId);
-  }, [undoStack, project.name, clips, selectedClipId]);
+  }, [undoStack, project.name, clips, tracks, selectedClipId]);
 
   const redo = useCallback(() => {
     if (redoStack.length === 0) return;
@@ -154,8 +185,10 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setUndoStack((prev) => [
       ...prev,
       {
+        description: 'Before Redo',
         projectName: project.name,
         clips: JSON.parse(JSON.stringify(clips)),
+        tracks: JSON.parse(JSON.stringify(tracks)),
         selectedClipId,
       },
     ]);
@@ -163,12 +196,13 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     setProject((p) => ({ ...p, name: next.projectName }));
     setClips(next.clips);
+    setTracks(next.tracks);
     setSelectedClipIdState(next.selectedClipId);
-  }, [redoStack, project.name, clips, selectedClipId]);
+  }, [redoStack, project.name, clips, tracks, selectedClipId]);
 
   const setProjectName = useCallback(
     (name: string) => {
-      pushSnapshot();
+      pushSnapshot('Rename Project');
       setProject((p) => ({ ...p, name }));
       setSaveStatus('Saving...');
       setTimeout(() => setSaveStatus('Saved'), 600);
@@ -177,7 +211,7 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   );
 
   const setCurrentTime = useCallback((time: number) => {
-    const clamped = Math.max(0, Math.min(INITIAL_PROJECT.duration, time));
+    const clamped = Math.max(0, time);
     setCurrentTimeState(clamped);
   }, []);
 
@@ -193,26 +227,42 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const setSelectedClipId = useCallback((id: string | null) => {
     setSelectedClipIdState(id);
     if (id) {
-      // Clear library asset selection when timeline clip is selected
       setSelectedAssetId(null);
     }
   }, []);
 
   const setZoom = useCallback((newZoom: number) => {
-    const clamped = Math.min(2.0, Math.max(0.5, newZoom));
+    const clamped = Math.min(5.0, Math.max(0.25, newZoom));
     setZoomState(clamped);
   }, []);
 
   const zoomIn = useCallback(() => {
-    setZoomState((z) => Math.min(2.0, Number((z + 0.25).toFixed(2))));
+    setZoomState((current) => {
+      const idx = ZOOM_LEVELS.findIndex((z) => z >= current);
+      if (idx !== -1 && idx < ZOOM_LEVELS.length - 1) {
+        return ZOOM_LEVELS[idx + 1];
+      }
+      return Math.min(5.0, Number((current * 1.3).toFixed(2)));
+    });
   }, []);
 
   const zoomOut = useCallback(() => {
-    setZoomState((z) => Math.max(0.5, Number((z - 0.25).toFixed(2))));
+    setZoomState((current) => {
+      const rev = [...ZOOM_LEVELS].reverse();
+      const idx = rev.findIndex((z) => z <= current);
+      if (idx !== -1 && idx < rev.length - 1) {
+        return rev[idx + 1];
+      }
+      return Math.max(0.25, Number((current * 0.7).toFixed(2)));
+    });
   }, []);
 
   const zoomFit = useCallback(() => {
     setZoomState(1.0);
+  }, []);
+
+  const toggleSnap = useCallback(() => {
+    setSnapEnabled((prev) => !prev);
   }, []);
 
   const setAspectRatio = useCallback((ratio: AspectRatio) => {
@@ -223,51 +273,274 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setIsMuted((prev) => !prev);
   }, []);
 
+  // Track operations
   const toggleTrackLock = useCallback((trackId: string) => {
+    pushSnapshot('Toggle Track Lock');
     setTracks((prev) =>
       prev.map((t) => (t.id === trackId ? { ...t, locked: !t.locked } : t)),
     );
-  }, []);
+  }, [pushSnapshot]);
 
   const toggleTrackVisibility = useCallback((trackId: string) => {
+    pushSnapshot('Toggle Track Visibility');
     setTracks((prev) =>
       prev.map((t) => (t.id === trackId ? { ...t, visible: !t.visible } : t)),
     );
-  }, []);
+  }, [pushSnapshot]);
 
   const toggleTrackMute = useCallback((trackId: string) => {
+    pushSnapshot('Toggle Track Mute');
     setTracks((prev) =>
       prev.map((t) => (t.id === trackId ? { ...t, muted: !t.muted } : t)),
     );
+  }, [pushSnapshot]);
+
+  const setTrackVolume = useCallback((trackId: string, vol: number) => {
+    setTracks((prev) =>
+      prev.map((t) => (t.id === trackId ? { ...t, volume: Math.min(200, Math.max(0, vol)) } : t)),
+    );
   }, []);
 
-  const updateClipTransform = useCallback(
-    (clipId: string, partial: Partial<ClipTransform>) => {
-      pushSnapshot();
-      setClips((prev) =>
-        prev.map((c) =>
+  const setTrackHeight = useCallback((trackId: string, height: number) => {
+    const clamped = Math.min(200, Math.max(40, height));
+    setTracks((prev) =>
+      prev.map((t) => (t.id === trackId ? { ...t, height: clamped } : t)),
+    );
+  }, []);
+
+  // Frame Stepping
+  const stepFrame = useCallback((direction: 'forward' | 'backward', stepSeconds?: number) => {
+    const delta = stepSeconds !== undefined ? stepSeconds : 1 / project.fps;
+    setCurrentTimeState((prev) => {
+      const next = direction === 'forward' ? prev + delta : prev - delta;
+      return Math.max(0, Math.min(project.duration, next));
+    });
+  }, [project.fps, project.duration]);
+
+  // Phase 3 Editing Operations
+  const moveClip = useCallback(
+    (clipId: string, newStartTime: number, newTrackId?: string) => {
+      setClips((prev) => {
+        const targetClip = prev.find((c) => c.id === clipId);
+        if (!targetClip) return prev;
+
+        const effectiveTrackId = newTrackId || targetClip.trackId;
+        const targetTrack = tracks.find((t) => t.id === effectiveTrackId);
+        if (targetTrack?.locked) return prev;
+
+        if (newTrackId && targetTrack && !canDropOnTrack(targetClip.type, targetTrack.type)) {
+          return prev;
+        }
+
+        const clampedStart = Math.max(0, newStartTime);
+
+        return prev.map((c) =>
           c.id === clipId
-            ? { ...c, transform: { ...c.transform, ...partial } }
+            ? { ...c, startTime: clampedStart, trackId: effectiveTrackId }
             : c,
-        ),
-      );
+        );
+      });
     },
-    [pushSnapshot],
+    [tracks],
   );
 
-  const updateClipAudio = useCallback(
-    (clipId: string, partial: Partial<ClipAudio>) => {
-      pushSnapshot();
-      setClips((prev) =>
-        prev.map((c) =>
-          c.id === clipId && c.audio
-            ? { ...c, audio: { ...c.audio, ...partial } }
+  const trimClipLeft = useCallback(
+    (clipId: string, newStartTime: number, newTrimStart: number, newDuration: number) => {
+      setClips((prev) => {
+        const targetClip = prev.find((c) => c.id === clipId);
+        if (!targetClip) return prev;
+        const track = tracks.find((t) => t.id === targetClip.trackId);
+        if (track?.locked) return prev;
+
+        if (newDuration < MIN_CLIP_DURATION) return prev;
+        if (newTrimStart < 0) return prev;
+        if (newStartTime < 0) return prev;
+
+        return prev.map((c) =>
+          c.id === clipId
+            ? {
+                ...c,
+                startTime: newStartTime,
+                trimStart: newTrimStart,
+                duration: newDuration,
+              }
             : c,
-        ),
+        );
+      });
+    },
+    [tracks],
+  );
+
+  const trimClipRight = useCallback(
+    (clipId: string, newDuration: number, newTrimEnd: number) => {
+      setClips((prev) => {
+        const targetClip = prev.find((c) => c.id === clipId);
+        if (!targetClip) return prev;
+        const track = tracks.find((t) => t.id === targetClip.trackId);
+        if (track?.locked) return prev;
+
+        if (newDuration < MIN_CLIP_DURATION) return prev;
+        if (newTrimEnd > targetClip.sourceDuration) return prev;
+
+        return prev.map((c) =>
+          c.id === clipId
+            ? {
+                ...c,
+                duration: newDuration,
+                trimEnd: newTrimEnd,
+              }
+            : c,
+        );
+      });
+    },
+    [tracks],
+  );
+
+  const splitClip = useCallback(
+    (clipId?: string): boolean => {
+      const targetId = clipId || selectedClipId;
+      if (!targetId) return false;
+
+      const targetClip = clips.find((c) => c.id === targetId);
+      if (!targetClip) return false;
+
+      const track = tracks.find((t) => t.id === targetClip.trackId);
+      if (track?.locked) return false;
+
+      const splitOffset = currentTime - targetClip.startTime;
+
+      // Must be strictly inside the clip boundaries
+      if (splitOffset <= MIN_CLIP_DURATION || splitOffset >= targetClip.duration - MIN_CLIP_DURATION) {
+        return false;
+      }
+
+      pushSnapshot('Split Clip');
+
+      const clipA: Clip = {
+        ...JSON.parse(JSON.stringify(targetClip)),
+        id: `clip_${Date.now()}_a`,
+        duration: splitOffset,
+        trimEnd: targetClip.trimStart + splitOffset,
+      };
+
+      const clipB: Clip = {
+        ...JSON.parse(JSON.stringify(targetClip)),
+        id: `clip_${Date.now()}_b`,
+        startTime: targetClip.startTime + splitOffset,
+        duration: targetClip.duration - splitOffset,
+        trimStart: targetClip.trimStart + splitOffset,
+      };
+
+      setClips((prev) => prev.map((c) => (c.id === targetId ? clipA : c)).concat(clipB));
+      setSelectedClipIdState(clipB.id);
+
+      return true;
+    },
+    [selectedClipId, clips, tracks, currentTime, pushSnapshot],
+  );
+
+  const deleteClip = useCallback(
+    (clipId?: string) => {
+      const targetId = clipId || selectedClipId;
+      if (!targetId) return;
+
+      const targetClip = clips.find((c) => c.id === targetId);
+      if (!targetClip) return;
+
+      const track = tracks.find((t) => t.id === targetClip.trackId);
+      if (track?.locked) return;
+
+      pushSnapshot('Delete Clip');
+      setClips((prev) => prev.filter((c) => c.id !== targetId));
+      if (selectedClipId === targetId) {
+        setSelectedClipIdState(null);
+      }
+    },
+    [selectedClipId, clips, tracks, pushSnapshot],
+  );
+
+  const duplicateClip = useCallback(
+    (clipId?: string) => {
+      const targetId = clipId || selectedClipId;
+      if (!targetId) return;
+
+      const targetClip = clips.find((c) => c.id === targetId);
+      if (!targetClip) return;
+
+      const track = tracks.find((t) => t.id === targetClip.trackId);
+      if (track?.locked) return;
+
+      pushSnapshot('Duplicate Clip');
+
+      // Place duplicate right after original, or find next slot
+      const newStart = targetClip.startTime + targetClip.duration;
+      const dupClip: Clip = {
+        ...JSON.parse(JSON.stringify(targetClip)),
+        id: `clip_${Date.now()}_dup`,
+        startTime: newStart,
+      };
+
+      setClips((prev) => [...prev, dupClip]);
+      setSelectedClipIdState(dupClip.id);
+    },
+    [selectedClipId, clips, tracks, pushSnapshot],
+  );
+
+  const copyClip = useCallback(
+    (clipId?: string) => {
+      const targetId = clipId || selectedClipId;
+      if (!targetId) return;
+      const target = clips.find((c) => c.id === targetId);
+      if (target) {
+        setClipboardClip(JSON.parse(JSON.stringify(target)));
+      }
+    },
+    [selectedClipId, clips],
+  );
+
+  const pasteClip = useCallback(
+    (targetTrackId?: string): boolean => {
+      if (!clipboardClip) return false;
+
+      const trackId = targetTrackId || clipboardClip.trackId;
+      const targetTrack = tracks.find((t) => t.id === trackId);
+      if (!targetTrack || targetTrack.locked) return false;
+
+      if (!canDropOnTrack(clipboardClip.type, targetTrack.type)) {
+        return false;
+      }
+
+      pushSnapshot('Paste Clip');
+
+      const pastedClip: Clip = {
+        ...JSON.parse(JSON.stringify(clipboardClip)),
+        id: `clip_${Date.now()}_paste`,
+        trackId: trackId,
+        startTime: currentTime,
+      };
+
+      setClips((prev) => [...prev, pastedClip]);
+      setSelectedClipIdState(pastedClip.id);
+      return true;
+    },
+    [clipboardClip, tracks, currentTime, pushSnapshot],
+  );
+
+  const updateClip = useCallback(
+    (clipId: string, updates: Partial<Clip>) => {
+      setClips((prev) =>
+        prev.map((c) => (c.id === clipId ? { ...c, ...updates } : c)),
       );
     },
-    [pushSnapshot],
+    [],
   );
+
+  const toggleClipMute = useCallback((clipId: string) => {
+    pushSnapshot('Toggle Clip Mute');
+    setClips((prev) =>
+      prev.map((c) => (c.id === clipId ? { ...c, muted: !c.muted } : c)),
+    );
+  }, [pushSnapshot]);
 
   const triggerSave = useCallback(() => {
     setSaveStatus('Saving...');
@@ -276,8 +549,7 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }, 450);
   }, []);
 
-  // --- Phase 2: Media Management Actions ---
-
+  // Phase 2: Media Management Actions
   const addAsset = useCallback((assetData: Omit<MediaAsset, 'id' | 'createdAt'>): MediaAsset => {
     const newAsset: MediaAsset = {
       ...assetData,
@@ -340,76 +612,41 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     [assets],
   );
 
-  // Add Clip from MediaAsset into Timeline Track (with collision avoidance & track validation)
+  // Add Clip from MediaAsset into Timeline Track
   const addClipFromAsset = useCallback(
     (asset: MediaAsset, trackId: string, dropTime?: number) => {
       const targetTrack = tracks.find((t) => t.id === trackId);
       if (!targetTrack) {
         return { success: false, error: 'Target track does not exist' };
       }
+      if (targetTrack.locked) {
+        return { success: false, error: 'Track is locked.' };
+      }
 
-      // Track compatibility validation
-      if (targetTrack.type === 'video' || targetTrack.type === 'overlay') {
-        if (asset.type !== 'video' && asset.type !== 'image') {
-          return {
-            success: false,
-            error: 'Drop this media on a compatible track.',
-          };
-        }
-      } else if (targetTrack.type === 'audio') {
-        if (asset.type !== 'audio') {
-          return {
-            success: false,
-            error: 'Drop this media on a compatible track.',
-          };
-        }
-      } else {
-        // Text / Subtitle track
+      if (!canDropOnTrack(asset.type, targetTrack.type)) {
         return {
           success: false,
           error: 'Drop this media on a compatible track.',
         };
       }
 
-      // Determine duration
+      // Determine duration & sourceDuration
       let duration = 8;
+      let sourceDuration = 8;
       if (asset.type === 'video') {
         duration = asset.duration && asset.duration > 0 ? Number(asset.duration.toFixed(2)) : 8;
+        sourceDuration = duration;
       } else if (asset.type === 'audio') {
         duration = asset.duration && asset.duration > 0 ? Number(asset.duration.toFixed(2)) : 10;
+        sourceDuration = duration;
       } else if (asset.type === 'image') {
-        duration = 5.0; // Section 19: default 5 seconds
+        duration = 5.0;
+        sourceDuration = Infinity;
       }
 
-      // Determine starting position
       let startTime = typeof dropTime === 'number' ? Math.max(0, dropTime) : currentTime;
 
-      // Ensure clip fits inside duration
-      if (startTime + duration > project.duration) {
-        duration = Math.max(1, project.duration - startTime);
-      }
-
-      // Collision avoidance with existing clips on that track
-      const existingClips = clips
-        .filter((c) => c.trackId === trackId)
-        .sort((a, b) => a.startTime - b.startTime);
-
-      for (const existing of existingClips) {
-        const existingEnd = existing.startTime + existing.duration;
-        // If overlaps with existing clip, move start time after existing clip
-        if (
-          (startTime >= existing.startTime && startTime < existingEnd) ||
-          (startTime + duration > existing.startTime && startTime < existing.startTime)
-        ) {
-          startTime = existingEnd;
-        }
-      }
-
-      if (startTime >= project.duration) {
-        startTime = Math.max(0, project.duration - duration);
-      }
-
-      pushSnapshot();
+      pushSnapshot('Add Clip to Timeline');
 
       const newClip: Clip = {
         id: `clip_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -421,6 +658,10 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         duration: Number(duration.toFixed(2)),
         trimStart: 0,
         trimEnd: duration,
+        sourceDuration: sourceDuration,
+        volume: 100,
+        muted: false,
+        locked: false,
         color:
           asset.type === 'video'
             ? '#2563eb'
@@ -428,7 +669,8 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             ? '#10b981'
             : '#8b5cf6',
         transform: {
-          position: { x: 0, y: 0 },
+          x: 0,
+          y: 0,
           scale: 100,
           rotation: 0,
           opacity: 100,
@@ -448,10 +690,24 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
       return { success: true, clip: newClip };
     },
-    [tracks, clips, currentTime, project.duration, pushSnapshot],
+    [tracks, currentTime, pushSnapshot],
   );
 
-  // Animation frame loop for playback
+  // Compute snap target timestamps
+  const snapTargets = useMemo(() => {
+    const targets = new Set<number>();
+    targets.add(0);
+    targets.add(currentTime);
+    targets.add(project.duration);
+
+    for (const c of clips) {
+      targets.add(c.startTime);
+      targets.add(c.startTime + c.duration);
+    }
+    return Array.from(targets);
+  }, [clips, currentTime, project.duration]);
+
+  // Playback loop
   const lastTimeRef = useRef<number | null>(null);
   const isPlayingRef = useRef(isPlaying);
   isPlayingRef.current = isPlaying;
@@ -494,7 +750,7 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     };
   }, [isPlaying, project.duration]);
 
-  // Global Keyboard shortcuts
+  // Global Keyboard Shortcuts (Section 39)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
@@ -506,26 +762,63 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         return;
       }
 
+      // Space: Play/Pause
       if (e.code === 'Space') {
         e.preventDefault();
         togglePlayPause();
-      } else if (e.code === 'Escape') {
+      }
+      // S: Split clip
+      else if (e.key === 's' || e.key === 'S') {
+        if (!e.ctrlKey && !e.metaKey) {
+          e.preventDefault();
+          splitClip();
+        }
+      }
+      // Delete / Backspace: Delete clip
+      else if (e.code === 'Delete' || e.code === 'Backspace') {
+        e.preventDefault();
+        deleteClip();
+      }
+      // Escape: Deselect
+      else if (e.code === 'Escape') {
         e.preventDefault();
         setSelectedClipIdState(null);
         setSelectedAssetId(null);
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+      }
+      // Arrow keys: Frame stepping
+      else if (e.code === 'ArrowLeft') {
         e.preventDefault();
-        if (e.shiftKey) {
-          redo();
-        } else {
-          undo();
+        stepFrame('backward', e.shiftKey ? 1.0 : undefined);
+      } else if (e.code === 'ArrowRight') {
+        e.preventDefault();
+        stepFrame('forward', e.shiftKey ? 1.0 : undefined);
+      }
+      // Ctrl/Cmd shortcuts
+      else if (e.ctrlKey || e.metaKey) {
+        const k = e.key.toLowerCase();
+        if (k === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) {
+            redo();
+          } else {
+            undo();
+          }
+        } else if (k === 'c') {
+          e.preventDefault();
+          copyClip();
+        } else if (k === 'v') {
+          e.preventDefault();
+          pasteClip();
+        } else if (k === 'd') {
+          e.preventDefault();
+          duplicateClip();
         }
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [togglePlayPause, undo, redo]);
+  }, [togglePlayPause, splitClip, deleteClip, stepFrame, undo, redo, copyClip, pasteClip, duplicateClip]);
 
   const selectedClip = clips.find((c) => c.id === selectedClipId) || null;
   const selectedAsset = assets.find((a) => a.id === selectedAssetId) || null;
@@ -539,6 +832,8 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     selectedClipId,
     activePanel,
     zoom,
+    snapEnabled,
+    activeSnapGuide,
     saveStatus,
     previewQuality,
     volume,
@@ -549,6 +844,8 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     assets,
     selectedAssetId,
     selectedAsset,
+    clipboardClip,
+    snapTargets,
     setProjectName,
     setCurrentTime,
     setIsPlaying,
@@ -559,6 +856,8 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     zoomIn,
     zoomOut,
     zoomFit,
+    toggleSnap,
+    setActiveSnapGuide,
     setAspectRatio,
     setPreviewQuality,
     setVolume,
@@ -566,10 +865,22 @@ export const EditorProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     toggleTrackLock,
     toggleTrackVisibility,
     toggleTrackMute,
-    updateClipTransform,
-    updateClipAudio,
+    setTrackVolume,
+    setTrackHeight,
+    moveClip,
+    trimClipLeft,
+    trimClipRight,
+    splitClip,
+    deleteClip,
+    duplicateClip,
+    copyClip,
+    pasteClip,
+    updateClip,
+    toggleClipMute,
+    stepFrame,
     undo,
     redo,
+    pushSnapshot,
     triggerSave,
     setSelectedAssetId,
     addAsset,

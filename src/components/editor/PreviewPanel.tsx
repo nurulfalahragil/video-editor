@@ -1,8 +1,9 @@
-import React, { useRef, useState, useEffect } from 'react';
-import { AspectRatio } from '../../types/editor';
+import React, { useRef, useState, useEffect, useMemo } from 'react';
+import { AspectRatio, Clip } from '../../types/editor';
 import { useEditorStore } from '../../store/editorStore';
 import { PreviewControls } from './PreviewControls';
-import { Monitor, Music, Film, Image as ImageIcon } from 'lucide-react';
+import { getSourceTimeForClip } from '../../utils/timelineMath';
+import { Monitor, Music } from 'lucide-react';
 
 export const PreviewPanel: React.FC = () => {
   const {
@@ -12,10 +13,9 @@ export const PreviewPanel: React.FC = () => {
     setPreviewQuality,
     selectedClip,
     currentTime,
-    setCurrentTime,
     clips,
+    tracks,
     isPlaying,
-    setIsPlaying,
     volume,
     isMuted,
     selectedAsset,
@@ -39,19 +39,38 @@ export const PreviewPanel: React.FC = () => {
     }
   };
 
-  // Find active timeline clips at currentTime
-  const activeTimelineClips = clips.filter(
-    (c) => currentTime >= c.startTime && currentTime <= c.startTime + c.duration,
-  );
+  // Section 47: Find active clips at currentTime
+  const activeTimelineClips = useMemo(() => {
+    return clips.filter(
+      (c) => currentTime >= c.startTime && currentTime <= c.startTime + c.duration,
+    );
+  }, [clips, currentTime]);
 
-  // Dominant active visual clip (video, overlay, or image)
-  const activeVisualClip =
-    activeTimelineClips.find(
-      (c) => c.type === 'video' || c.type === 'overlay' || c.type === 'image',
-    ) || activeTimelineClips[0];
+  // Filter clips by track visibility (Section 13: hidden tracks do not render in preview)
+  const visibleVisualClips = useMemo(() => {
+    return activeTimelineClips.filter((c) => {
+      const track = tracks.find((t) => t.id === c.trackId);
+      if (track && !track.visible) return false;
+      return c.type === 'video' || c.type === 'overlay' || c.type === 'image';
+    });
+  }, [activeTimelineClips, tracks]);
 
-  // Active audio clip
-  const activeAudioClip = activeTimelineClips.find((c) => c.type === 'audio');
+  // Dominant active visual clip (Overlay clips render on top of Video clips)
+  const activeVisualClip: Clip | undefined = useMemo(() => {
+    const overlay = visibleVisualClips.find((c) => c.type === 'overlay');
+    if (overlay) return overlay;
+    return visibleVisualClips.find((c) => c.type === 'video') || visibleVisualClips[0];
+  }, [visibleVisualClips]);
+
+  // Active audible audio clips (Section 14, 16, 50)
+  const activeAudioClip = useMemo(() => {
+    return activeTimelineClips.find((c) => {
+      if (c.type !== 'audio') return false;
+      const track = tracks.find((t) => t.id === c.trackId);
+      if (track?.muted || c.muted) return false;
+      return true;
+    });
+  }, [activeTimelineClips, tracks]);
 
   // Resolved asset for the active clip
   const clipAsset = activeVisualClip?.assetId
@@ -62,81 +81,78 @@ export const PreviewPanel: React.FC = () => {
     ? getAssetById(activeAudioClip.assetId)
     : undefined;
 
-  // Determine what is currently being previewed:
-  // Priority 1: Active clip on timeline at current playhead
-  // Priority 2: Selected media asset from library (if no active timeline clip)
   const isPreviewingTimelineClip = Boolean(activeVisualClip);
   const activeAsset = isPreviewingTimelineClip ? clipAsset : selectedAsset;
 
-  // Sync Video Element with Timeline Playhead & State
+  // Video source playback time calculation (Section 48: getSourceTimeForClip)
+  const videoSourceTime = useMemo(() => {
+    if (activeVisualClip) {
+      return getSourceTimeForClip(activeVisualClip, currentTime);
+    }
+    return currentTime;
+  }, [activeVisualClip, currentTime]);
+
+  // Audio source playback time calculation (Section 50)
+  const audioSourceTime = useMemo(() => {
+    if (activeAudioClip) {
+      return getSourceTimeForClip(activeAudioClip, currentTime);
+    }
+    return currentTime;
+  }, [activeAudioClip, currentTime]);
+
+  // Compounded audio volume: Master volume * Track volume * Clip volume
+  const computedAudioVolume = useMemo(() => {
+    if (isMuted) return 0;
+    if (!activeAudioClip) return volume / 100;
+    const track = tracks.find((t) => t.id === activeAudioClip.trackId);
+    const trackVol = (track?.volume ?? 100) / 100;
+    const clipVol = (activeAudioClip.volume ?? 100) / 100;
+    const masterVol = volume / 100;
+    return Math.min(1.0, masterVol * trackVol * clipVol);
+  }, [isMuted, activeAudioClip, tracks, volume]);
+
+  // Sync Video Element with Timeline (Sections 6, 48, 49)
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
-    video.volume = volume / 100;
+    video.volume = computedAudioVolume;
     video.muted = isMuted;
 
-    // Calculate target time inside the video
-    let targetTime = 0;
-    if (isPreviewingTimelineClip && activeVisualClip) {
-      targetTime = Math.max(0, currentTime - activeVisualClip.startTime);
-      if (typeof activeVisualClip.trimStart === 'number') {
-        targetTime += activeVisualClip.trimStart;
-      }
-    } else {
-      targetTime = currentTime;
-    }
-
-    // Only seek if difference is noticeable (> 0.15s) to avoid micro-jitter during smooth playback
-    if (!isSeekingRef.current && Math.abs(video.currentTime - targetTime) > 0.18) {
+    // Fast-seek only if drift is greater than 0.15s to keep playback silky smooth
+    if (!isSeekingRef.current && Math.abs(video.currentTime - videoSourceTime) > 0.15) {
       isSeekingRef.current = true;
-      video.currentTime = targetTime;
+      video.currentTime = videoSourceTime;
       setTimeout(() => {
         isSeekingRef.current = false;
       }, 50);
     }
 
     if (isPlaying) {
-      video.play().catch(() => {
-        // Autoplay policy or error catch
-      });
+      video.play().catch(() => {});
     } else {
       video.pause();
     }
-  }, [
-    currentTime,
-    isPlaying,
-    volume,
-    isMuted,
-    isPreviewingTimelineClip,
-    activeVisualClip,
-  ]);
+  }, [videoSourceTime, isPlaying, computedAudioVolume, isMuted]);
 
-  // Sync Audio Element (when audio clip is active or audio asset previewed)
+  // Sync Audio Element (Sections 50, 51)
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
-    audio.volume = volume / 100;
+    audio.volume = computedAudioVolume;
     audio.muted = isMuted;
 
-    let targetTime = 0;
-    if (activeAudioClip) {
-      targetTime = Math.max(0, currentTime - activeAudioClip.startTime);
-    } else {
-      targetTime = currentTime;
+    if (Math.abs(audio.currentTime - audioSourceTime) > 0.2) {
+      audio.currentTime = audioSourceTime;
     }
 
-    if (Math.abs(audio.currentTime - targetTime) > 0.2) {
-      audio.currentTime = targetTime;
-    }
-
-    if (isPlaying) {
+    if (isPlaying && activeAudioClip) {
       audio.play().catch(() => {});
     } else {
       audio.pause();
     }
-  }, [currentTime, isPlaying, volume, isMuted, activeAudioClip]);
+  }, [audioSourceTime, isPlaying, computedAudioVolume, isMuted, activeAudioClip]);
 
   return (
     <div
@@ -229,7 +245,7 @@ export const PreviewPanel: React.FC = () => {
           <div className="absolute w-3 h-px bg-white/20 pointer-events-none z-20" />
           <div className="absolute h-3 w-px bg-white/20 pointer-events-none z-20" />
 
-          {/* RENDER ACTIVE VIDEO, IMAGE, OR AUDIO */}
+          {/* RENDER VIDEO OR IMAGE MEDIA */}
           {activeAsset ? (
             <div className="w-full h-full relative flex items-center justify-center overflow-hidden">
               {activeAsset.type === 'video' ? (
@@ -238,7 +254,7 @@ export const PreviewPanel: React.FC = () => {
                   style={
                     activeVisualClip
                       ? {
-                          transform: `translate(${activeVisualClip.transform.position.x}px, ${activeVisualClip.transform.position.y}px) scale(${
+                          transform: `translate(${activeVisualClip.transform.x}px, ${activeVisualClip.transform.y}px) scale(${
                             activeVisualClip.transform.scale / 100
                           }) rotate(${activeVisualClip.transform.rotation}deg)`,
                           opacity: activeVisualClip.transform.opacity / 100,
@@ -261,7 +277,7 @@ export const PreviewPanel: React.FC = () => {
                   style={
                     activeVisualClip
                       ? {
-                          transform: `translate(${activeVisualClip.transform.position.x}px, ${activeVisualClip.transform.position.y}px) scale(${
+                          transform: `translate(${activeVisualClip.transform.x}px, ${activeVisualClip.transform.y}px) scale(${
                             activeVisualClip.transform.scale / 100
                           }) rotate(${activeVisualClip.transform.rotation}deg)`,
                           opacity: activeVisualClip.transform.opacity / 100,
@@ -278,9 +294,8 @@ export const PreviewPanel: React.FC = () => {
                   />
                 </div>
               ) : (
-                /* AUDIO PLAYER VISUALIZER */
+                /* AUDIO DISPLAY */
                 <div className="flex flex-col items-center justify-center text-center p-6 text-purple-400">
-                  <audio ref={audioRef} src={activeAsset.url} preload="auto" />
                   <div className="w-16 h-16 rounded-full bg-purple-500/10 border border-purple-500/30 flex items-center justify-center mb-3 shadow-lg">
                     <Music className="w-8 h-8 text-purple-300" />
                   </div>
@@ -290,18 +305,6 @@ export const PreviewPanel: React.FC = () => {
                   <p className="text-[11px] font-mono text-purple-300/80 mt-1">
                     Audio Track · {activeAsset.duration ? `${activeAsset.duration.toFixed(1)}s` : ''}
                   </p>
-                  {/* Subtle simulated audio bar visualizer */}
-                  <div className="flex items-center gap-1 mt-4 h-6">
-                    {[16, 28, 20, 36, 44, 24, 32, 48, 20, 14, 30, 42, 26, 18].map((h, i) => (
-                      <span
-                        key={i}
-                        style={{
-                          height: isPlaying ? `${Math.min(24, (h * (i % 2 === 0 ? 0.7 : 0.9)))}px` : '4px',
-                        }}
-                        className="w-1 bg-purple-400/80 rounded-full transition-all duration-150"
-                      />
-                    ))}
-                  </div>
                 </div>
               )}
 
@@ -316,7 +319,6 @@ export const PreviewPanel: React.FC = () => {
               )}
             </div>
           ) : (
-            /* Centered default placeholder as required in Section 6 */
             <div className="flex flex-col items-center justify-center text-center p-6 select-none">
               <span className="text-base font-semibold tracking-wide text-slate-500 uppercase">
                 Preview
@@ -327,6 +329,11 @@ export const PreviewPanel: React.FC = () => {
                   : 'No active clip at playhead'}
               </span>
             </div>
+          )}
+
+          {/* Synchronized Audio Element */}
+          {audioClipAsset && (
+            <audio ref={audioRef} src={audioClipAsset.url} preload="auto" />
           )}
 
           {/* Aspect ratio and FPS indicator */}

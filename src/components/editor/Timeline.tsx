@@ -1,12 +1,11 @@
-import React, { useRef, useState } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import { useEditorStore } from '../../store/editorStore';
 import { TimelineToolbar } from './TimelineToolbar';
 import { TimelineRuler } from './TimelineRuler';
 import { TimelineTrack } from './TimelineTrack';
 import { Playhead } from './Playhead';
-import { FolderUp, Sparkles, AlertCircle } from 'lucide-react';
-
-const BASE_PIXELS_PER_SECOND = 40;
+import { BASE_PIXELS_PER_SECOND, formatTime } from '../../utils/timelineMath';
+import { FolderUp, AlertCircle, Magnet } from 'lucide-react';
 
 export const Timeline: React.FC = () => {
   const {
@@ -16,6 +15,9 @@ export const Timeline: React.FC = () => {
     project,
     setSelectedClipId,
     setActivePanel,
+    currentTime,
+    isPlaying,
+    activeSnapGuide,
   } = useEditorStore();
 
   const pixelsPerSecond = BASE_PIXELS_PER_SECOND * zoom;
@@ -34,12 +36,32 @@ export const Timeline: React.FC = () => {
     }
   };
 
+  // Section 37: Auto Scroll During Playback
+  useEffect(() => {
+    if (!isPlaying || !scrollContainerRef.current) return;
+
+    const container = scrollContainerRef.current;
+    const playheadPx = currentTime * pixelsPerSecond;
+    const scrollLeft = container.scrollLeft;
+    const clientWidth = container.clientWidth;
+
+    // Fixed track header is 192px (w-48)
+    const visibleStart = scrollLeft;
+    const visibleEnd = scrollLeft + clientWidth - 220;
+
+    if (playheadPx > visibleEnd) {
+      container.scrollLeft = playheadPx - clientWidth * 0.25;
+    } else if (playheadPx < visibleStart) {
+      container.scrollLeft = Math.max(0, playheadPx - 50);
+    }
+  }, [currentTime, isPlaying, pixelsPerSecond]);
+
   return (
-    <div className="h-64 bg-[#0a0d12] border-t border-[#1f2633] flex flex-col shrink-0 select-none overflow-hidden z-10 relative">
+    <div className="h-72 bg-[#0a0d12] border-t border-[#1f2633] flex flex-col shrink-0 select-none overflow-hidden z-10 relative">
       {/* Top Timeline Toolbar */}
       <TimelineToolbar />
 
-      {/* Track Compatibility Toast Warning */}
+      {/* Toast Warning */}
       {toastMessage && (
         <div className="absolute top-11 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 bg-red-950/90 border border-red-700/80 text-red-200 text-xs px-3.5 py-1.5 rounded-md shadow-xl animate-fade-in">
           <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
@@ -51,7 +73,7 @@ export const Timeline: React.FC = () => {
       <div
         ref={scrollContainerRef}
         onClick={handleBackgroundClick}
-        className="flex-1 overflow-x-auto overflow-y-auto relative flex flex-col"
+        className="flex-1 overflow-x-auto overflow-y-auto relative flex flex-col scroll-smooth"
       >
         {/* Ruler Row */}
         <div className="flex sticky top-0 z-30 shadow-xs">
@@ -73,12 +95,27 @@ export const Timeline: React.FC = () => {
           />
         </div>
 
-        {/* Tracks Container with Playhead Overlay */}
+        {/* Tracks Container with Playhead & Snap Guides Overlay */}
         <div className="relative flex-1">
-          {/* Vertical Playhead - absolute positioned across all tracks */}
+          {/* Section 32: Visual Snap Guide Line */}
+          {activeSnapGuide !== null && (
+            <div
+              style={{
+                left: `calc(12rem + ${activeSnapGuide * pixelsPerSecond}px)`,
+              }}
+              className="absolute top-0 bottom-0 w-0.5 bg-amber-400/90 pointer-events-none z-35 shadow-[0_0_8px_rgba(251,191,36,0.8)]"
+            >
+              <div className="absolute -top-6 left-1/2 -translate-x-1/2 bg-amber-500 text-slate-950 font-mono text-[9px] font-bold px-1.5 py-0.5 rounded shadow-md whitespace-nowrap flex items-center gap-1">
+                <Magnet className="w-2.5 h-2.5" />
+                <span>Snap: {formatTime(activeSnapGuide)}</span>
+              </div>
+            </div>
+          )}
+
+          {/* Vertical Playhead */}
           <div
             style={{
-              left: '12rem', // Matches w-48 (48 * 4px = 192px = 12rem)
+              left: '12rem', // Matches w-48
             }}
             className="absolute top-0 bottom-0 pointer-events-none z-40"
           >
@@ -101,7 +138,7 @@ export const Timeline: React.FC = () => {
             />
           ))}
 
-          {/* Section 30: Empty Timeline State Message */}
+          {/* Empty Timeline State Message */}
           {clips.length === 0 && (
             <div className="absolute inset-0 left-48 flex items-center justify-center pointer-events-none z-20">
               <div className="bg-[#121622]/90 border border-[#232b3b] rounded-lg p-3.5 flex flex-col items-center justify-center text-center shadow-lg pointer-events-auto">

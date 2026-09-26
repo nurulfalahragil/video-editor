@@ -1,5 +1,6 @@
-import React, { useRef, useCallback } from 'react';
-import { useEditorStore, formatSecondsToTime } from '../../store/editorStore';
+import React, { useRef, useCallback, useMemo } from 'react';
+import { useEditorStore } from '../../store/editorStore';
+import { formatTime, snapTime } from '../../utils/timelineMath';
 
 interface TimelineRulerProps {
   pixelsPerSecond: number;
@@ -11,18 +12,38 @@ export const TimelineRuler: React.FC<TimelineRulerProps> = ({
   pixelsPerSecond,
   totalDuration,
 }) => {
-  const { setCurrentTime } = useEditorStore();
+  const { setCurrentTime, snapEnabled, snapTargets, setActiveSnapGuide } = useEditorStore();
   const rulerRef = useRef<HTMLDivElement>(null);
+
+  // Compute dynamic intervals based on zoom / pixelsPerSecond (Section 52)
+  const { majorInterval, minorInterval } = useMemo(() => {
+    if (pixelsPerSecond >= 200) {
+      return { majorInterval: 1, minorInterval: 0.2 };
+    }
+    if (pixelsPerSecond >= 100) {
+      return { majorInterval: 2, minorInterval: 0.5 };
+    }
+    if (pixelsPerSecond >= 40) {
+      return { majorInterval: 5, minorInterval: 1 };
+    }
+    if (pixelsPerSecond >= 20) {
+      return { majorInterval: 10, minorInterval: 2 };
+    }
+    return { majorInterval: 30, minorInterval: 5 };
+  }, [pixelsPerSecond]);
 
   const calculateTimeFromEvent = useCallback(
     (e: React.MouseEvent | MouseEvent) => {
       if (!rulerRef.current) return 0;
       const rect = rulerRef.current.getBoundingClientRect();
       const clickX = e.clientX - rect.left;
-      const calculatedTime = clickX / pixelsPerSecond;
-      return Math.max(0, Math.min(totalDuration, calculatedTime));
+      const rawTime = Math.max(0, Math.min(totalDuration, clickX / pixelsPerSecond));
+
+      const { snappedTime, target } = snapTime(rawTime, snapTargets, 0.15, snapEnabled);
+      setActiveSnapGuide(target);
+      return snappedTime;
     },
-    [pixelsPerSecond, totalDuration],
+    [pixelsPerSecond, totalDuration, snapTargets, snapEnabled, setActiveSnapGuide],
   );
 
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -36,6 +57,7 @@ export const TimelineRuler: React.FC<TimelineRulerProps> = ({
     };
 
     const handleMouseUp = () => {
+      setActiveSnapGuide(null);
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
@@ -44,25 +66,26 @@ export const TimelineRuler: React.FC<TimelineRulerProps> = ({
     window.addEventListener('mouseup', handleMouseUp);
   };
 
-  // Generate ruler markers
-  // Every 5 seconds is a major step (00:00, 00:05, 00:10, etc.)
-  const majorInterval = 5;
-  const majorTicksCount = Math.floor(totalDuration / majorInterval) + 1;
-  const majorTicks = Array.from({ length: majorTicksCount }, (_, i) => i * majorInterval);
+  const majorTicks = useMemo(() => {
+    const count = Math.floor(totalDuration / majorInterval) + 1;
+    return Array.from({ length: count }, (_, i) => i * majorInterval);
+  }, [totalDuration, majorInterval]);
 
-  // Minor ticks every 1 second
-  const minorTicks = Array.from({ length: Math.floor(totalDuration) + 1 }, (_, i) => i);
+  const minorTicks = useMemo(() => {
+    const count = Math.floor(totalDuration / minorInterval) + 1;
+    return Array.from({ length: count }, (_, i) => Number((i * minorInterval).toFixed(2)));
+  }, [totalDuration, minorInterval]);
 
   return (
     <div
       ref={rulerRef}
       onMouseDown={handleMouseDown}
-      style={{ width: `${totalDuration * pixelsPerSecond}px` }}
+      style={{ width: `${Math.max(1, totalDuration * pixelsPerSecond)}px` }}
       className="h-7 bg-[#11141c] border-b border-[#1f2633] relative cursor-pointer select-none overflow-hidden"
     >
-      {/* 1-second minor ticks */}
+      {/* Minor tick marks */}
       {minorTicks.map((second) => {
-        if (second % majorInterval === 0) return null; // handled by major tick
+        if (Math.abs(second % majorInterval) < 0.001) return null;
         return (
           <div
             key={`minor-${second}`}
@@ -72,15 +95,15 @@ export const TimelineRuler: React.FC<TimelineRulerProps> = ({
         );
       })}
 
-      {/* 5-second major ticks with text labels */}
+      {/* Major tick marks with time labels */}
       {majorTicks.map((second) => (
         <div
           key={`major-${second}`}
           style={{ left: `${second * pixelsPerSecond}px` }}
           className="absolute top-0 bottom-0 flex flex-col justify-between pointer-events-none"
         >
-          <span className="text-[10px] font-mono font-medium text-slate-400 pl-1">
-            {formatSecondsToTime(second)}
+          <span className="text-[10px] font-mono font-medium text-slate-400 pl-1 whitespace-nowrap">
+            {formatTime(second)}
           </span>
           <div className="w-px h-3.5 bg-slate-400" />
         </div>
